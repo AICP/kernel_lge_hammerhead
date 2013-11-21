@@ -443,6 +443,11 @@ static int mdss_dsi_panel_off(struct mdss_panel_data *pdata)
 	prevent_sleep = prevent_sleep || (dt2w_switch > 0);
 #endif
 #endif
+#ifdef CONFIG_PWRKEY_SUSPEND
+	if (pwrkey_pressed)
+		prevent_sleep = false;
+#endif
+
 	if (pdata == NULL) {
 		pr_err("%s: Invalid input data\n", __func__);
 		return -EINVAL;
