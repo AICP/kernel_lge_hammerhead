@@ -94,7 +94,7 @@ static struct dbs_tuners {
 	.down_threshold = DEF_FREQUENCY_DOWN_THRESHOLD,
 	.sampling_down_factor = DEF_SAMPLING_DOWN_FACTOR,
 	.ignore_nice = 0,
-	.freq_step = 5,
+	.freq_step = 10,
 };
 
 static inline u64 get_cpu_idle_time_jiffy(unsigned int cpu, u64 *wall)
@@ -418,17 +418,8 @@ static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
 		return;
 	}
 
-	/*
-	 * The optimal frequency is the frequency that is the lowest that
-	 * can support the current CPU usage without triggering the up
-	 * policy. To be safe, we focus 10 points under the threshold.
-	 */
-	if (max_load < (dbs_tuners_ins.down_threshold - 10)) {
-		freq_target = (dbs_tuners_ins.freq_step * policy->max) / 100;
-
-		this_dbs_info->requested_freq -= freq_target;
-		if (this_dbs_info->requested_freq < policy->min)
-			this_dbs_info->requested_freq = policy->min;
+	/* Check for frequency decrease */
+	if (max_load < (dbs_tuners_ins.down_threshold)) {
 
 		/*
 		 * if we cannot reduce the frequency anymore, break out early
