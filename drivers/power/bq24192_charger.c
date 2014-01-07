@@ -1040,30 +1040,27 @@ static void bq24192_external_power_changed(struct power_supply *psy)
 
 	if (chip->usb_online &&
 			bq24192_is_charger_present(chip)) {
-		chip->usb_psy->get_property(chip->usb_psy,
+
+                if (force_fast_charge == 1) {
+                chip->icl_first = true;
+		bq24192_set_input_vin_limit(chip,
+				chip->icl_vbus_mv - 2 * VIN_LIMIT_STEP_MV);
+		bq24192_set_input_i_limit(chip, adap_tbl[0].input_limit);
+		bq24192_set_ibat_max(chip, adap_tbl[0].chg_limit);
+		wake_lock(&chip->icl_wake_lock);
+		schedule_delayed_work(&chip->input_limit_work,
+					msecs_to_jiffies(200));
+		pr_info("ac is online! i_limit = %d v_limit = %d\n",
+					adap_tbl[0].chg_limit, chip->vin_limit_mv);
+       } else {
+                chip->usb_psy->get_property(chip->usb_psy,
 				  POWER_SUPPLY_PROP_CURRENT_MAX, &ret);
 		bq24192_set_input_vin_limit(chip, chip->vin_limit_mv);
-
-#ifdef CONFIG_FORCE_FAST_CHARGE
-		if (force_fast_charge)
-			bq24192_set_input_i_limit(chip, USB_FASTCHG_LOAD);
-		else
-			bq24192_set_input_i_limit(chip, ret.intval / 1000);
-#else
-		bq24192_set_input_i_limit(chip, ret.intval / 1000);
-#endif
-		bq24192_set_ibat_max(chip, USB_MAX_IBAT_MA);
-#ifdef CONFIG_FORCE_FAST_CHARGE
-		if (force_fast_charge)
-			pr_info("usb is online and fast charge enabled! i_limit = %d v_limit = %d\n",
-					USB_FASTCHG_LOAD, chip->vin_limit_mv);
-		else
-			pr_info("usb is online! i_limit = %d v_limit = %d\n",
+                bq24192_set_input_i_limit(chip, ret.intval / 1000);
+                pr_info("usb is online! i_limit = %d v_limit = %d\n",
 					ret.intval / 1000, chip->vin_limit_mv);
-#else
-		pr_info("usb is online! i_limit = %d v_limit = %d\n",
-				ret.intval / 1000, chip->vin_limit_mv);
-#endif
+               }
+
 	} else if (chip->ac_online &&
 			bq24192_is_charger_present(chip)) {
 		chip->icl_first = true;
