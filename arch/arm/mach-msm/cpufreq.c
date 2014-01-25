@@ -501,9 +501,6 @@ static int cpufreq_parse_dt(struct device *dev)
 		krait_freq_table[i].frequency = data[j];
 	krait_freq_table[i].frequency = CPUFREQ_TABLE_END;
 #endif
-
-	if (ports)
-		devm_kfree(dev, ports);
 	devm_kfree(dev, data);
 
 	return 0;
