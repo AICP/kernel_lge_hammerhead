@@ -28,7 +28,10 @@
 #define MDP_CORE_CLK_RATE	100000000
 #define MDP_VSYNC_CLK_RATE	19200000
 
-static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd);
+static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd,
+					struct mdp_overlay *req,
+					int image_size,
+					int *pipe_ndx);
 static int mdp3_overlay_unset(struct msm_fb_data_type *mfd, int ndx);
 static int mdp3_histogram_stop(struct mdp3_session_data *session,
 					u32 block);
@@ -535,9 +538,11 @@ static int mdp3_ctrl_off(struct msm_fb_data_type *mfd)
 off_error:
 	mdp3_session->status = 0;
 	mdp3_bufq_deinit(&mdp3_session->bufq_out);
+	if (mdp3_session->overlay.id != MSMFB_NEW_REQUEST) {
+		mdp3_session->overlay.id = MSMFB_NEW_REQUEST;
+		mdp3_bufq_deinit(&mdp3_session->bufq_in);
+	}
 	mutex_unlock(&mdp3_session->lock);
-	if (mdp3_session->overlay.id != MSMFB_NEW_REQUEST)
-		mdp3_overlay_unset(mfd, mdp3_session->overlay.id);
 	return 0;
 }
 
@@ -687,7 +692,10 @@ static int mdp3_ctrl_display_commit_kickoff(struct msm_fb_data_type *mfd,
 	return rc;
 }
 
-static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd)
+static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd,
+					struct mdp_overlay *req,
+					int image_size,
+					int *pipe_ndx)
 {
 	struct fb_info *fbi;
 	struct mdp3_session_data *mdp3_session;
