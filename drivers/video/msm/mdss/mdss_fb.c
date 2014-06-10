@@ -1282,6 +1282,12 @@ static int mdss_fb_open(struct fb_info *info, int user)
 	pinfo->ref_cnt++;
 	mfd->ref_cnt++;
 
+        /* Stop the splash thread once userspace open the fb node */
+	if (mfd->splash_thread && mfd->ref_cnt > 1) {
+		kthread_stop(mfd->splash_thread);
+		mfd->splash_thread = NULL;
+	}
+
 	return 0;
 
 blank_error:
