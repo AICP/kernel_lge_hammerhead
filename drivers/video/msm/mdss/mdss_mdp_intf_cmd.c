@@ -26,7 +26,7 @@
 /* wait for at most 2 vsync for lowest refresh rate (24hz) */
 #define KOFF_TIMEOUT msecs_to_jiffies(84)
 
-#define STOP_TIMEOUT msecs_to_jiffies(16 * (VSYNC_EXPIRE_TICK + 2))
+#define STOP_TIMEOUT(hz) msecs_to_jiffies((1000 / hz) * (VSYNC_EXPIRE_TICK + 2))
 #define ULPS_ENTER_TIME msecs_to_jiffies(100)
 
 struct mdss_mdp_cmd_ctx {
@@ -207,8 +207,8 @@ static inline void mdss_mdp_cmd_clk_on(struct mdss_mdp_cmd_ctx *ctx)
 		ctx->clk_enabled = 1;
 		if (cancel_delayed_work_sync(&ctx->ulps_work))
 			pr_debug("deleted pending ulps work\n");
-		mdss_mdp_ctl_intf_event
-			(ctx->ctl, MDSS_EVENT_PANEL_CLK_CTRL, (void *)1);
+
+		mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
 
 		if (ctx->ulps) {
 			if (mdss_mdp_cmd_tearcheck_setup(ctx->ctl, 1))
@@ -218,7 +218,9 @@ static inline void mdss_mdp_cmd_clk_on(struct mdss_mdp_cmd_ctx *ctx)
 			ctx->ulps = false;
 		}
 
-		mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
+		mdss_mdp_ctl_intf_event
+			(ctx->ctl, MDSS_EVENT_PANEL_CLK_CTRL, (void *)1);
+
 		mdss_mdp_hist_intr_setup(&mdata->hist_intr, MDSS_IRQ_RESUME);
 	}
 	spin_lock_irqsave(&ctx->clk_lock, flags);
@@ -391,14 +393,6 @@ static void __mdss_mdp_cmd_ulps_work(struct work_struct *work)
 		return;
 	}
 
-	mutex_lock(&ctx->clk_mtx);
-	if (ctx->clk_enabled) {
-		mutex_unlock(&ctx->clk_mtx);
-		pr_warn("Cannot enter ulps mode if DSI clocks are on\n");
-		return;
-	}
-	mutex_unlock(&ctx->clk_mtx);
-
 	if (!ctx->panel_on) {
 		pr_err("Panel is off. skipping ULPS configuration\n");
 		return;
@@ -407,6 +401,8 @@ static void __mdss_mdp_cmd_ulps_work(struct work_struct *work)
 	if (!mdss_mdp_ctl_intf_event(ctx->ctl, MDSS_EVENT_DSI_ULPS_CTRL,
 		(void *)1)) {
 		ctx->ulps = true;
+		ctx->ctl->play_cnt = 0;
+		mdss_mdp_footswitch_ctrl_ulps(0, &ctx->ctl->mfd->pdev->dev);
 	}
 }
 
@@ -582,10 +578,12 @@ int mdss_mdp_cmd_kickoff(struct mdss_mdp_ctl *ctl, void *arg)
 int mdss_mdp_cmd_stop(struct mdss_mdp_ctl *ctl)
 {
 	struct mdss_mdp_cmd_ctx *ctx;
+	struct mdss_panel_info *pinfo;
 	unsigned long flags;
 	struct mdss_mdp_vsync_handler *tmp, *handle;
 	int need_wait = 0;
 	int ret = 0;
+	int hz;
 
 	ctx = (struct mdss_mdp_cmd_ctx *) ctl->priv_data;
 	if (!ctx) {
@@ -603,10 +601,27 @@ int mdss_mdp_cmd_stop(struct mdss_mdp_ctl *ctl)
 	}
 	spin_unlock_irqrestore(&ctx->clk_lock, flags);
 
+	hz = mdss_panel_get_framerate(&ctl->panel_data->panel_info);
+
 	if (need_wait)
-		if (wait_for_completion_timeout(&ctx->stop_comp, STOP_TIMEOUT)
-		    <= 0)
+		if (wait_for_completion_timeout(&ctx->stop_comp,
+					STOP_TIMEOUT(hz))
+		    <= 0) {
 			WARN(1, "stop cmd time out\n");
+
+			if (IS_ERR_OR_NULL(ctl->panel_data)) {
+				pr_err("no panel data\n");
+			} else {
+				pinfo = &ctl->panel_data->panel_info;
+
+				if (pinfo->panel_dead) {
+					mdss_mdp_irq_disable
+						(MDSS_MDP_IRQ_PING_PONG_RD_PTR,
+								ctx->pp_num);
+					ctx->rdptr_enabled = 0;
+				}
+			}
+		}
 
 	if (cancel_work_sync(&ctx->clk_work))
 		pr_debug("no pending clk work\n");

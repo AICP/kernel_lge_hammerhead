@@ -71,6 +71,12 @@ struct mdss_intr {
 	spinlock_t lock;
 };
 
+struct mdss_debug_inf {
+	void *debug_data;
+	int (*debug_dump_stats)(void *data, char *buf, int len);
+	void (*debug_enable_clock)(int on);
+};
+
 struct mdss_data_type {
 	u32 mdp_rev;
 	struct clk *mdp_clk[MDSS_MAX_CLK];
@@ -94,6 +100,7 @@ struct mdss_data_type {
 	u32 has_bwc;
 	u32 has_decimation;
 	u8 has_wfd_blk;
+	u8 has_wb_ad;
 
 	u32 mdp_irq_mask;
 	u32 mdp_hist_irq_mask;
@@ -152,7 +159,8 @@ struct mdss_data_type {
 	struct mdss_iommu_map_type *iommu_map;
 
 	struct early_suspend early_suspend;
-	void *debug_data;
+	struct mdss_debug_inf debug_inf;
+	int current_bus_idx;
 	bool mixer_switched;
 	bool ulps;
 

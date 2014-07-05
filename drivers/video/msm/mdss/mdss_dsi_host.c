@@ -50,6 +50,8 @@ struct mdss_hw mdss_dsi1_hw = {
 
 #define DSI_EVENT_Q_MAX	4
 
+#define DSI_BTA_EVENT_TIMEOUT (HZ / 10)
+
 /* event */
 struct dsi_event_q {
 	struct mdss_dsi_ctrl_pdata *ctrl;
@@ -105,6 +107,7 @@ void mdss_dsi_ctrl_init(struct mdss_dsi_ctrl_pdata *ctrl)
 	init_completion(&ctrl->dma_comp);
 	init_completion(&ctrl->mdp_comp);
 	init_completion(&ctrl->video_comp);
+	init_completion(&ctrl->bta_comp);
 	spin_lock_init(&ctrl->irq_lock);
 	spin_lock_init(&ctrl->mdp_lock);
 	mutex_init(&ctrl->mutex);
@@ -145,22 +148,26 @@ void mdss_dsi_clk_req(struct mdss_dsi_ctrl_pdata *ctrl, int enable)
 		mutex_unlock(&ctrl->cmd_mutex);
 	}
 
-	mdss_dsi_clk_ctrl(ctrl, enable);
+	mdss_dsi_clk_ctrl(ctrl, DSI_ALL_CLKS, enable);
 }
 
 void mdss_dsi_pll_relock(struct mdss_dsi_ctrl_pdata *ctrl)
 {
 	int i, cnt;
 
-	cnt = ctrl->clk_cnt;
+	/*
+	 * todo: this code does not work very well with dual
+	 * dsi use cases. Need to fix this eventually.
+	 */
+	cnt = ctrl->link_clk_cnt;
 
 	/* disable dsi clk */
 	for (i = 0; i < cnt; i++)
-		mdss_dsi_clk_ctrl(ctrl, 0);
+		mdss_dsi_clk_ctrl(ctrl, DSI_LINK_CLKS, 0);
 
 	/* enable dsi clk */
 	for (i = 0; i < cnt; i++)
-		mdss_dsi_clk_ctrl(ctrl, 1);
+		mdss_dsi_clk_ctrl(ctrl, DSI_LINK_CLKS, 1);
 }
 
 void mdss_dsi_enable_irq(struct mdss_dsi_ctrl_pdata *ctrl, u32 term)
@@ -960,7 +967,7 @@ void mdss_dsi_host_init(struct mdss_panel_data *pdata)
 	wmb();
 }
 
-void mdss_set_tx_power_mode(int mode, struct mdss_panel_data *pdata)
+void mdss_dsi_set_tx_power_mode(int mode, struct mdss_panel_data *pdata)
 {
 	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
 	u32 data;
@@ -1137,14 +1144,14 @@ void mdss_dsi_op_mode_config(int mode,
 
 	if (mode == DSI_VIDEO_MODE) {
 		dsi_ctrl |= 0x03;
-		intr_ctrl = DSI_INTR_CMD_DMA_DONE_MASK;
+		intr_ctrl = DSI_INTR_CMD_DMA_DONE_MASK | DSI_INTR_BTA_DONE_MASK;
 	} else {		/* command mode */
 		dsi_ctrl |= 0x05;
 		if (pdata->panel_info.type == MIPI_VIDEO_PANEL)
 			dsi_ctrl |= 0x02;
 
 		intr_ctrl = DSI_INTR_CMD_DMA_DONE_MASK | DSI_INTR_ERROR_MASK |
-				DSI_INTR_CMD_MDP_DONE_MASK;
+			DSI_INTR_CMD_MDP_DONE_MASK | DSI_INTR_BTA_DONE_MASK;
 	}
 
 	if (ctrl_pdata->shared_pdata.broadcast_enable)
@@ -1188,6 +1195,45 @@ void mdss_dsi_cmd_bta_sw_trigger(struct mdss_panel_data *pdata)
 	mdss_dsi_ack_err_status(ctrl_pdata);
 
 	pr_debug("%s: BTA done, status = %d\n", __func__, status);
+}
+
+int mdss_dsi_bta_status_check(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
+{
+	int ret = 0;
+	unsigned long flag;
+
+	if (ctrl_pdata == NULL) {
+		pr_err("%s: Invalid input data\n", __func__);
+
+		/*
+		 * This should not return error otherwise
+		 * BTA status thread will treat it as dead panel scenario
+		 * and request for blank/unblank
+		 */
+		return 0;
+	}
+
+	pr_debug("%s: Checking BTA status\n", __func__);
+
+	mdss_dsi_clk_ctrl(ctrl_pdata, DSI_ALL_CLKS, 1);
+	spin_lock_irqsave(&ctrl_pdata->mdp_lock, flag);
+	INIT_COMPLETION(ctrl_pdata->bta_comp);
+	mdss_dsi_enable_irq(ctrl_pdata, DSI_BTA_TERM);
+	spin_unlock_irqrestore(&ctrl_pdata->mdp_lock, flag);
+	MIPI_OUTP(ctrl_pdata->ctrl_base + 0x098, 0x01); /* trigger  */
+	wmb();
+
+	ret = wait_for_completion_killable_timeout(&ctrl_pdata->bta_comp,
+						DSI_BTA_EVENT_TIMEOUT);
+	if (ret <= 0) {
+		mdss_dsi_disable_irq(ctrl_pdata, DSI_BTA_TERM);
+		pr_err("%s: DSI BTA error: %i\n", __func__, ret);
+	}
+
+	mdss_dsi_clk_ctrl(ctrl_pdata, DSI_ALL_CLKS, 0);
+	pr_debug("%s: BTA done with ret: %d\n", __func__, ret);
+
+	return ret;
 }
 
 static char set_tear_on[2] = {0x35, 0x00};
@@ -1800,14 +1846,14 @@ void mdss_dsi_cmdlist_commit(struct mdss_dsi_ctrl_pdata *ctrl, int from_mdp)
 	mdss_bus_bandwidth_ctrl(1);
 
 	pr_debug("%s:  from_mdp=%d pid=%d\n", __func__, from_mdp, current->pid);
-	mdss_dsi_clk_ctrl(ctrl, 1);
+	mdss_dsi_clk_ctrl(ctrl, DSI_ALL_CLKS, 1);
 
 	if (req->flags & CMD_REQ_RX)
 		mdss_dsi_cmdlist_rx(ctrl, req);
 	else
 		mdss_dsi_cmdlist_tx(ctrl, req);
 
-	mdss_dsi_clk_ctrl(ctrl, 0);
+	mdss_dsi_clk_ctrl(ctrl, DSI_ALL_CLKS, 0);
 	mdss_bus_bandwidth_ctrl(0);
 
 need_lock:
@@ -1934,11 +1980,11 @@ static int dsi_event_thread(void *data)
 		}
 
 		if (todo & DSI_EV_MDP_BUSY_RELEASE) {
-			spin_lock(&ctrl->mdp_lock);
+			spin_lock_irqsave(&ctrl->mdp_lock, flag);
 			ctrl->mdp_busy = false;
 			mdss_dsi_disable_irq_nosync(ctrl, DSI_MDP_TERM);
 			complete(&ctrl->mdp_comp);
-			spin_unlock(&ctrl->mdp_lock);
+			spin_unlock_irqrestore(&ctrl->mdp_lock, flag);
 
 			/* enable dsi error interrupt */
 			mdss_dsi_err_intr_ctrl(ctrl, DSI_INTR_ERROR_MASK, 1);
@@ -2109,6 +2155,13 @@ irqreturn_t mdss_dsi_isr(int irq, void *ptr)
 		ctrl->mdp_busy = false;
 		mdss_dsi_disable_irq_nosync(ctrl, DSI_MDP_TERM);
 		complete(&ctrl->mdp_comp);
+		spin_unlock(&ctrl->mdp_lock);
+	}
+
+	if (isr & DSI_INTR_BTA_DONE) {
+		spin_lock(&ctrl->mdp_lock);
+		mdss_dsi_disable_irq_nosync(ctrl, DSI_BTA_TERM);
+		complete(&ctrl->bta_comp);
 		spin_unlock(&ctrl->mdp_lock);
 	}
 

@@ -288,6 +288,7 @@ void mdss_disable_irq_nosync(struct mdss_hw *hw)
 	pr_debug("Disable HW=%d irq ena=%d mask=%x\n", hw->hw_ndx,
 			mdss_res->irq_ena, mdss_res->irq_mask);
 
+	spin_lock(&mdss_lock);
 	if (!(mdss_res->irq_mask & ndx_bit)) {
 		pr_warn("MDSS HW ndx=%d is NOT set, mask=%x, hist mask=%x\n",
 			hw->hw_ndx, mdss_res->mdp_irq_mask,
@@ -299,6 +300,7 @@ void mdss_disable_irq_nosync(struct mdss_hw *hw)
 			disable_irq_nosync(mdss_res->irq);
 		}
 	}
+	spin_unlock(&mdss_lock);
 }
 EXPORT_SYMBOL(mdss_disable_irq_nosync);
 
@@ -497,7 +499,16 @@ void mdss_mdp_hist_irq_disable(u32 irq)
 	spin_unlock_irqrestore(&mdp_lock, irq_flags);
 }
 
-/* called from interrupt context */
+/**
+ * mdss_mdp_irq_disable_nosync() - disable mdp irq
+ * @intr_type:	mdp interface type
+ * @intf_num:	mdp interface num
+ *
+ * This fucntion is called from interrupt context
+ * mdp_lock is already held at up stream (mdss_irq_handler)
+ * therefore spin_lock(&mdp_lock) is not allowed here
+ *
+*/
 void mdss_mdp_irq_disable_nosync(u32 intr_type, u32 intf_num)
 {
 	u32 irq;
@@ -872,9 +883,75 @@ int mdss_iommu_init(struct mdss_data_type *mdata)
 	return 0;
 }
 
+static int mdss_debug_stat_ctl_dump(struct mdss_mdp_ctl *ctl,
+		char *bp, int len)
+{
+	int total = 0;
+
+	if (!ctl->ref_cnt)
+		return 0;
+
+	if (ctl->intf_num) {
+		total = scnprintf(bp, len,
+			"intf%d: play: %08u \tvsync: %08u \tunderrun: %08u\n",
+				ctl->intf_num, ctl->play_cnt,
+				ctl->vsync_cnt, ctl->underrun_cnt);
+	} else {
+		total = scnprintf(bp, len, "wb: \tmode=%x \tplay: %08u\n",
+				ctl->opmode, ctl->play_cnt);
+	}
+
+	return total;
+}
+
+static int mdss_debug_dump_stats(void *data, char *buf, int len)
+{
+	struct mdss_data_type *mdata = data;
+	struct mdss_mdp_pipe *pipe;
+	int i, total = 0;
+
+	for (i = 0; i < mdata->nctl; i++)
+		total += mdss_debug_stat_ctl_dump(mdata->ctl_off + i,
+			buf + total, len - total);
+
+	total += scnprintf(buf + total, len - total, "\n");
+
+	for (i = 0; i < mdata->nvig_pipes; i++) {
+		pipe = mdata->vig_pipes + i;
+		total += scnprintf(buf + total, len - total,
+			"VIG%d :   %08u\t", i, pipe->play_cnt);
+	}
+	total += scnprintf(buf + total, len - total, "\n");
+
+	for (i = 0; i < mdata->nrgb_pipes; i++) {
+		pipe = mdata->rgb_pipes + i;
+		total += scnprintf(buf + total, len - total,
+			"RGB%d :   %08u\t", i, pipe->play_cnt);
+	}
+	total += scnprintf(buf + total, len - total, "\n");
+
+	for (i = 0; i < mdata->ndma_pipes; i++) {
+		pipe = mdata->dma_pipes + i;
+		total += scnprintf(buf + total, len - total,
+			"DMA%d :   %08u\t", i, pipe->play_cnt);
+	}
+	return total;
+}
+
+static void mdss_debug_enable_clock(int on)
+{
+	if (on)
+		mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
+	else
+		mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
+}
+
 static int mdss_mdp_debug_init(struct mdss_data_type *mdata)
 {
 	int rc;
+
+	mdata->debug_inf.debug_dump_stats = mdss_debug_dump_stats;
+	mdata->debug_inf.debug_enable_clock = mdss_debug_enable_clock;
 
 	rc = mdss_debugfs_init(mdata);
 	if (rc)
@@ -894,6 +971,10 @@ int mdss_hw_init(struct mdss_data_type *mdata)
 	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
 	mdata->mdp_rev = MDSS_MDP_REG_READ(MDSS_MDP_REG_HW_VERSION);
 	pr_info_once("MDP Rev=%x\n", mdata->mdp_rev);
+
+	/* disable hw underrun recovery */
+	writel_relaxed(0x0, mdata->mdp_base +
+			MDSS_MDP_REG_VIDEO_INTF_UNDERFLOW_CTL);
 
 	if (mdata->hw_settings) {
 		struct mdss_hw_settings *hws = mdata->hw_settings;
@@ -1860,6 +1941,9 @@ static int mdss_mdp_parse_dt_ad_cfg(struct platform_device *pdev)
 	if (mdata->nad_cfgs > mdata->nmixers_intf)
 		return -EINVAL;
 
+	mdata->has_wb_ad = of_property_read_bool(pdev->dev.of_node,
+		"qcom,mdss-has-wb-ad");
+
 	ad_offsets = kzalloc(sizeof(u32) * mdata->nad_cfgs, GFP_KERNEL);
 	if (!ad_offsets) {
 		pr_err("no mem assigned: kzalloc fail\n");
@@ -2021,8 +2105,10 @@ static void mdss_mdp_footswitch_ctrl(struct mdss_data_type *mdata, int on)
 		pr_debug("Enable MDP FS\n");
 		if (!mdata->fs_ena) {
 			regulator_enable(mdata->fs);
-			mdss_mdp_cx_ctrl(mdata, true);
-			mdss_mdp_batfet_ctrl(mdata, true);
+			if (!mdata->ulps) {
+				mdss_mdp_cx_ctrl(mdata, true);
+				mdss_mdp_batfet_ctrl(mdata, true);
+			}
 		}
 		mdata->fs_ena = true;
 	} else {
@@ -2030,10 +2116,38 @@ static void mdss_mdp_footswitch_ctrl(struct mdss_data_type *mdata, int on)
 		mdss_iommu_dettach(mdata);
 		if (mdata->fs_ena) {
 			regulator_disable(mdata->fs);
-			mdss_mdp_cx_ctrl(mdata, false);
-			mdss_mdp_batfet_ctrl(mdata, false);
+			if (!mdata->ulps) {
+				mdss_mdp_cx_ctrl(mdata, false);
+				mdss_mdp_batfet_ctrl(mdata, false);
+			}
 		}
 		mdata->fs_ena = false;
+	}
+}
+
+/**
+ * mdss_mdp_footswitch_ctrl_ulps() - MDSS GDSC control with ULPS feature
+ * @on: 1 to turn on footswitch, 0 to turn off footswitch
+ * @dev: framebuffer device node
+ *
+ * MDSS GDSC can be voted off during idle-screen usecase for MIPI DSI command
+ * mode displays with Ultra-Low Power State (ULPS) feature enabled. Upon
+ * subsequent frame update, MDSS GDSC needs to turned back on and hw state
+ * needs to be restored.
+ */
+void mdss_mdp_footswitch_ctrl_ulps(int on, struct device *dev)
+{
+	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
+
+	pr_debug("called on=%d\n", on);
+	if (on) {
+		pm_runtime_get_sync(dev);
+		mdss_iommu_attach(mdata);
+		mdss_hw_init(mdata);
+		mdata->ulps = false;
+	} else {
+		mdata->ulps = true;
+		pm_runtime_put_sync(dev);
 	}
 }
 

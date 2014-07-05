@@ -19,9 +19,11 @@
 #include <linux/msm_mdp.h>
 #include <linux/platform_device.h>
 #include <linux/notifier.h>
+#include <linux/kref.h>
 
 #include "mdss.h"
 #include "mdss_mdp_hwio.h"
+#include "mdss_fb.h"
 
 #define MDSS_MDP_DEFAULT_INTR_MASK 0
 #define MDSS_MDP_CURSOR_WIDTH 64
@@ -31,6 +33,7 @@
 #define MDP_CLK_DEFAULT_RATE	200000000
 #define PHASE_STEP_SHIFT	21
 #define MAX_MIXER_WIDTH		2048
+#define MAX_LINE_BUFFER_WIDTH	2048
 #define MAX_MIXER_HEIGHT	0xFFFF
 #define MAX_IMG_WIDTH		0x3FFF
 #define MAX_IMG_HEIGHT		0x3FFF
@@ -347,7 +350,8 @@ struct mdss_mdp_pipe {
 	struct mdss_mdp_shared_reg_ctrl clk_ctrl;
 	struct mdss_mdp_shared_reg_ctrl clk_status;
 
-	atomic_t ref_cnt;
+	struct kref kref;
+
 	u32 play_cnt;
 	int pid;
 	bool is_handed_off;
@@ -418,6 +422,7 @@ struct mdss_overlay_private {
 
 	struct mdss_mdp_data free_list[MAX_FREE_LIST_SIZE];
 	int free_list_size;
+	int ad_state;
 
 	struct sw_sync_timeline *vsync_timeline;
 	struct mdss_mdp_vsync_handler vsync_retire_handler;
@@ -453,6 +458,17 @@ static inline u32 mdss_mdp_pingpong_read(struct mdss_mdp_mixer *mixer, u32 reg)
 	return readl_relaxed(mixer->pingpong_base + reg);
 }
 
+static inline int mdss_mdp_iommu_dyn_attach_supported(
+	struct mdss_data_type *mdata)
+{
+	return (mdata->mdp_rev >= MDSS_MDP_HW_REV_103);
+}
+
+static inline int mdss_mdp_line_buffer_width(void)
+{
+	return MAX_LINE_BUFFER_WIDTH;
+}
+
 irqreturn_t mdss_mdp_isr(int irq, void *ptr);
 int mdss_iommu_attach(struct mdss_data_type *mdata);
 int mdss_iommu_dettach(struct mdss_data_type *mdata);
@@ -486,6 +502,12 @@ int mdss_mdp_overlay_get_buf(struct msm_fb_data_type *mfd,
 			     struct msmfb_data *planes,
 			     int num_planes,
 			     u32 flags);
+int mdss_mdp_overlay_pipe_setup(struct msm_fb_data_type *mfd,
+	struct mdp_overlay *req, struct mdss_mdp_pipe **ppipe);
+void mdss_mdp_handoff_cleanup_pipes(struct msm_fb_data_type *mfd,
+							u32 type);
+int mdss_mdp_overlay_release(struct msm_fb_data_type *mfd, int ndx);
+int mdss_mdp_overlay_start(struct msm_fb_data_type *mfd);
 int mdss_mdp_video_addr_setup(struct mdss_data_type *mdata,
 		u32 *offsets,  u32 count);
 int mdss_mdp_video_start(struct mdss_mdp_ctl *ctl);
@@ -652,6 +674,8 @@ int mdss_mdp_wb_get_format(struct msm_fb_data_type *mfd,
 
 int mdss_mdp_wb_set_secure(struct msm_fb_data_type *mfd, int enable);
 int mdss_mdp_wb_get_secure(struct msm_fb_data_type *mfd, uint8_t *enable);
+void mdss_mdp_ctl_restore(struct mdss_mdp_ctl *ctl);
+void mdss_mdp_footswitch_ctrl_ulps(int on, struct device *dev);
 
 #define mfd_to_mdp5_data(mfd) (mfd->mdp.private1)
 #define mfd_to_mdata(mfd) (((struct mdss_overlay_private *)\
