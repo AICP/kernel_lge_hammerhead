@@ -89,7 +89,13 @@ void mdss_dsi_ctrl_init(struct mdss_dsi_ctrl_pdata *ctrl)
 		ctrl->ndx = DSI_CTRL_1;
 	}
 
+	ctrl->panel_mode = ctrl->panel_data.panel_info.mipi.mode;
+
 	ctrl_list[ctrl->ndx] = ctrl;	/* keep it */
+
+	if (ctrl->shared_pdata.broadcast_enable)
+		if (ctrl->ndx == DSI_CTRL_1)
+			ctrl->flags |= DSI_FLAG_CLOCK_MASTER;
 
 	if (mdss_register_irq(ctrl->dsi_hw))
 		pr_err("%s: mdss_register_irq failed.\n", __func__);
@@ -112,6 +118,22 @@ void mdss_dsi_ctrl_init(struct mdss_dsi_ctrl_pdata *ctrl)
 						"mdss_dsi_event");
 		dsi_event.inited  = 1;
 	}
+}
+
+struct mdss_dsi_ctrl_pdata *mdss_dsi_ctrl_slave(
+				struct mdss_dsi_ctrl_pdata *ctrl)
+{
+	int ndx;
+	struct mdss_dsi_ctrl_pdata *sctrl = NULL;
+
+	/* only two controllers */
+	ndx = ctrl->ndx;
+	ndx += 1;
+	ndx %= DSI_CTRL_MAX;
+	sctrl = ctrl_list[ndx];
+
+	return sctrl;
+
 }
 
 void mdss_dsi_clk_req(struct mdss_dsi_ctrl_pdata *ctrl, int enable)
@@ -798,12 +820,12 @@ void mdss_dsi_cmd_test_pattern(struct mdss_panel_data *pdata)
 	MIPI_OUTP((ctrl_pdata->ctrl_base) + 0x015c, 0x0);
 }
 
-void mdss_dsi_host_init(struct mipi_panel_info *pinfo,
-				struct mdss_panel_data *pdata)
+void mdss_dsi_host_init(struct mdss_panel_data *pdata)
 {
 	u32 dsi_ctrl, intr_ctrl;
 	u32 data;
 	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
+	struct mipi_panel_info *pinfo = NULL;
 
 	if (pdata == NULL) {
 		pr_err("%s: Invalid input data\n", __func__);
@@ -813,9 +835,9 @@ void mdss_dsi_host_init(struct mipi_panel_info *pinfo,
 	ctrl_pdata = container_of(pdata, struct mdss_dsi_ctrl_pdata,
 				panel_data);
 
-	pinfo->rgb_swap = DSI_RGB_SWAP_RGB;
+	pinfo = &pdata->panel_info.mipi;
 
-	ctrl_pdata->panel_mode = pinfo->mode;
+	pinfo->rgb_swap = DSI_RGB_SWAP_RGB;
 
 	if (pinfo->mode == DSI_VIDEO_MODE) {
 		data = 0;
@@ -2061,10 +2083,10 @@ irqreturn_t mdss_dsi_isr(int irq, void *ptr)
 					DSI_INTR_CMD_DMA_DONE);
 		}
 
-	pr_debug("%s: isr=%x", __func__, isr);
+	pr_debug("%s: ndx=%d isr=%x\n", __func__, ctrl->ndx, isr);
 
 	if (isr & DSI_INTR_ERROR) {
-		pr_err("%s: isr=%x %x", __func__, isr, (int)DSI_INTR_ERROR);
+		pr_err("%s: ndx=%d isr=%x\n", __func__, ctrl->ndx, isr);
 		mdss_dsi_error(ctrl);
 	}
 
