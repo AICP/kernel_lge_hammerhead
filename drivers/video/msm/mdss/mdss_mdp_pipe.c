@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -29,6 +29,12 @@
 #define MAX_BPP 4
 
 #define PIPE_HALT_TIMEOUT_US	0x4000
+
+/* following offsets are relative to ctrl register bit offset */
+#define CLK_FORCE_ON_OFFSET	0x0
+#define CLK_FORCE_OFF_OFFSET	0x1
+/* following offsets are relative to status register bit offset */
+#define CLK_STATUS_OFFSET	0x0
 
 static DEFINE_MUTEX(mdss_mdp_sspp_lock);
 static DEFINE_MUTEX(mdss_mdp_smp_lock);
@@ -202,7 +208,7 @@ int mdss_mdp_smp_reserve(struct mdss_mdp_pipe *pipe)
 	u32 num_blks = 0, reserved = 0;
 	struct mdss_mdp_plane_sizes ps;
 	int i;
-	int rc = 0, rot_mode = 0;
+	int rc = 0, rot_mode = 0, wb_mixer = 0;
 	u32 nlines, format;
 	u16 width;
 
@@ -288,6 +294,9 @@ int mdss_mdp_smp_reserve(struct mdss_mdp_pipe *pipe)
 	else
 		nlines = pipe->bwc_mode ? 1 : 2;
 
+	if (pipe->mixer->type == MDSS_MDP_MIXER_TYPE_WRITEBACK)
+		wb_mixer = 1;
+
 	mutex_lock(&mdss_mdp_smp_lock);
 	for (i = (MAX_PLANES - 1); i >= ps.num_planes; i--) {
 		if (bitmap_weight(pipe->smp_map[i].allocated, SMP_MB_CNT)) {
@@ -299,7 +308,7 @@ int mdss_mdp_smp_reserve(struct mdss_mdp_pipe *pipe)
 	}
 
 	for (i = 0; i < ps.num_planes; i++) {
-		if (rot_mode) {
+		if (rot_mode || wb_mixer) {
 			num_blks = 1;
 		} else {
 			num_blks = DIV_ROUND_UP(ps.ystride[i] * nlines,
@@ -535,7 +544,7 @@ static struct mdss_mdp_pipe *mdss_mdp_pipe_init(struct mdss_mdp_mixer *mixer,
 	}
 
 	if (pipe && mdss_mdp_pipe_fetch_halt(pipe)) {
-		pr_err("%d failed because vbif client is in bad state\n",
+		pr_err("%d failed because pipe is in bad state\n",
 			pipe->num);
 		atomic_dec(&pipe->ref_cnt);
 		return NULL;
@@ -665,15 +674,68 @@ static int mdss_mdp_pipe_free(struct mdss_mdp_pipe *pipe)
 	pr_debug("ndx=%x pnum=%d ref_cnt=%d\n", pipe->ndx, pipe->num,
 			atomic_read(&pipe->ref_cnt));
 
-	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
-	mdss_mdp_pipe_sspp_term(pipe);
-	mdss_mdp_smp_free(pipe);
+	if (pipe->play_cnt) {
+		mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
+		mdss_mdp_pipe_fetch_halt(pipe);
+		mdss_mdp_pipe_sspp_term(pipe);
+		mdss_mdp_smp_free(pipe);
+		mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
+	} else {
+		mdss_mdp_smp_unreserve(pipe);
+	}
+
 	pipe->flags = 0;
 	pipe->bwc_mode = 0;
 	pipe->mfd = NULL;
-	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 
 	return 0;
+}
+
+static int mdss_mdp_is_pipe_idle(struct mdss_mdp_pipe *pipe,
+	bool ignore_force_on)
+{
+	u32 reg_val;
+	u32 vbif_idle_mask, forced_on_mask, clk_status_idle_mask;
+	bool is_idle = false, is_forced_on;
+	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
+
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
+
+	forced_on_mask = BIT(pipe->clk_ctrl.bit_off + CLK_FORCE_ON_OFFSET);
+	reg_val = readl_relaxed(mdata->mdp_base + pipe->clk_ctrl.reg_off);
+	is_forced_on = (reg_val & forced_on_mask) ? true : false;
+
+	pr_debug("pipe#:%d clk_ctrl: 0x%x forced_on_mask: 0x%x\n", pipe->num,
+		reg_val, forced_on_mask);
+	/* if forced on then no need to check status */
+	if (!is_forced_on) {
+		clk_status_idle_mask =
+			BIT(pipe->clk_status.bit_off + CLK_STATUS_OFFSET);
+		reg_val = readl_relaxed(mdata->mdp_base +
+			pipe->clk_status.reg_off);
+
+		if (reg_val & clk_status_idle_mask)
+			is_idle = false;
+
+		pr_debug("pipe#:%d clk_status:0x%x clk_status_idle_mask:0x%x\n",
+			pipe->num, reg_val, clk_status_idle_mask);
+	}
+
+	if (!ignore_force_on && (is_forced_on || !is_idle))
+		goto exit;
+
+	vbif_idle_mask = BIT(pipe->xin_id + 16);
+	reg_val = readl_relaxed(mdata->vbif_base + MMSS_VBIF_XIN_HALT_CTRL1);
+
+	if (reg_val & vbif_idle_mask)
+		is_idle = true;
+
+	pr_debug("pipe#:%d XIN_HALT_CTRL1: 0x%x\n", pipe->num, reg_val);
+
+exit:
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
+
+	return is_idle;
 }
 
 /**
@@ -695,18 +757,15 @@ int mdss_mdp_pipe_fetch_halt(struct mdss_mdp_pipe *pipe)
 	u32 reg_val, idle_mask, status;
 	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
 
-	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
-
-	idle_mask = BIT(pipe->xin_id + 16);
-	reg_val = readl_relaxed(mdata->vbif_base + MMSS_VBIF_XIN_HALT_CTRL1);
-
-	is_idle = (reg_val & idle_mask) ? true : false;
+	is_idle = mdss_mdp_is_pipe_idle(pipe, true);
 	if (!is_idle) {
-		pr_debug("%pS: pipe%d is not idle. xin_id=%d halt_ctrl1=0x%x\n",
-			__builtin_return_address(0), pipe->num, pipe->xin_id,
-			reg_val);
+		pr_err("%pS: pipe%d is not idle. xin_id=%d\n",
+			__builtin_return_address(0), pipe->num, pipe->xin_id);
 
+		mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
 		mutex_lock(&mdata->reg_lock);
+		idle_mask = BIT(pipe->xin_id + 16);
+
 		reg_val = readl_relaxed(mdata->vbif_base +
 			MMSS_VBIF_XIN_HALT_CTRL0);
 		writel_relaxed(reg_val | BIT(pipe->xin_id),
@@ -727,9 +786,10 @@ int mdss_mdp_pipe_fetch_halt(struct mdss_mdp_pipe *pipe)
 			MMSS_VBIF_XIN_HALT_CTRL0);
 		writel_relaxed(reg_val & ~BIT(pipe->xin_id),
 			mdata->vbif_base + MMSS_VBIF_XIN_HALT_CTRL0);
+
 		mutex_unlock(&mdata->reg_lock);
+		mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 	}
-	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 
 	return rc;
 }
@@ -806,31 +866,14 @@ int mdss_mdp_pipe_handoff(struct mdss_mdp_pipe *pipe)
 		pipe->src_fmt->bpp);
 
 	pipe->is_handed_off = true;
+	pipe->play_cnt = 1;
 	atomic_inc(&pipe->ref_cnt);
 
 error:
 	return rc;
 }
 
-void mdss_mdp_crop_rect(struct mdss_mdp_img_rect *src_rect,
-	struct mdss_mdp_img_rect *dst_rect,
-	const struct mdss_mdp_img_rect *sci_rect)
-{
-	struct mdss_mdp_img_rect res;
-	mdss_mdp_intersect_rect(&res, dst_rect, sci_rect);
 
-	if (res.w && res.h) {
-		if ((res.w != dst_rect->w) || (res.h != dst_rect->h)) {
-			src_rect->x = src_rect->x + (res.x - dst_rect->x);
-			src_rect->y = src_rect->y + (res.y - dst_rect->y);
-			src_rect->w = res.w;
-			src_rect->h = res.h;
-		}
-		*dst_rect = (struct mdss_mdp_img_rect)
-			{(res.x - sci_rect->x), (res.y - sci_rect->y),
-			res.w, res.h};
-	}
-}
 
 static int mdss_mdp_image_setup(struct mdss_mdp_pipe *pipe)
 {
