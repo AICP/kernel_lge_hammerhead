@@ -55,6 +55,9 @@
 #include "mdss_mdp.h"
 #include "mdss_debug.h"
 
+#define CREATE_TRACE_POINTS
+#include "mdss_mdp_trace.h"
+
 struct mdss_data_type *mdss_res;
 
 static int mdss_fb_mem_get_iommu_domain(void)
@@ -693,6 +696,7 @@ void mdss_mdp_clk_ctrl(int enable, int isr)
 		}
 	}
 
+	MDSS_XLOG(mdp_clk_cnt, changed, enable, current->pid);
 	pr_debug("%s: clk_cnt=%d changed=%d enable=%d\n",
 			__func__, mdp_clk_cnt, changed, enable);
 
@@ -798,6 +802,8 @@ int mdss_iommu_attach(struct mdss_data_type *mdata)
 	int i, rc = 0;
 
 	mutex_lock(&mdp_iommu_lock);
+	MDSS_XLOG(mdata->iommu_attached);
+
 	if (mdata->iommu_attached) {
 		pr_debug("mdp iommu already attached\n");
 		goto end;
@@ -838,6 +844,8 @@ int mdss_iommu_dettach(struct mdss_data_type *mdata)
 	int i;
 
 	mutex_lock(&mdp_iommu_lock);
+	MDSS_XLOG(mdata->iommu_attached);
+
 	if (!mdata->iommu_attached) {
 		pr_debug("mdp iommu already dettached\n");
 		mutex_unlock(&mdp_iommu_lock);
@@ -980,7 +988,7 @@ static int mdss_mdp_debug_init(struct mdss_data_type *mdata)
 	if (rc)
 		return rc;
 
-	mdss_debug_register_base(NULL, mdata->mdp_base, mdata->mdp_reg_size);
+	mdss_debug_register_base("mdp", mdata->mdp_base, mdata->mdp_reg_size);
 
 	return 0;
 }
@@ -1952,6 +1960,36 @@ static void mdss_mdp_parse_dt_fudge_factors(struct platform_device *pdev,
 	}
 }
 
+static int mdss_mdp_parse_dt_clk_levels(struct platform_device *pdev)
+{
+	int rc, len = 0;
+	char *prop_name = "qcom,mdss-clk-levels";
+	struct mdss_data_type *mdata = platform_get_drvdata(pdev);
+
+	of_find_property(pdev->dev.of_node, prop_name, &len);
+	if (len < 1)
+		return 0;
+
+	len = len/sizeof(u32);
+	mdata->nclk_lvl = len;
+
+	if (mdata->nclk_lvl) {
+		mdata->clock_levels = kzalloc(sizeof(u32) * mdata->nclk_lvl,
+					      GFP_KERNEL);
+		if (!mdata->clock_levels) {
+			pr_err("no mem assigned for mdata clock_levels\n");
+			return -ENOMEM;
+		}
+
+		rc = mdss_mdp_parse_dt_handler(pdev, prop_name, mdata->clock_levels,
+					       mdata->nclk_lvl);
+		if (rc)
+			pr_debug("clock levels not found\n");
+	}
+
+	return 0;
+}
+
 static int mdss_mdp_parse_dt_prefill(struct platform_device *pdev)
 {
 	struct mdss_data_type *mdata = platform_get_drvdata(pdev);
@@ -2083,6 +2121,10 @@ static int mdss_mdp_parse_dt_misc(struct platform_device *pdev)
 			"qcom,max-bandwidth-high-kbps", &mdata->max_bw_high);
 	if (rc)
 		pr_debug("max bandwidth (high) property not specified\n");
+
+	rc = mdss_mdp_parse_dt_clk_levels(pdev);
+	if (rc)
+		pr_debug("clk levels property not specified\n");
 
 	return 0;
 }
