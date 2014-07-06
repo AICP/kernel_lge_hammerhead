@@ -71,10 +71,25 @@ struct mdss_intr {
 	spinlock_t lock;
 };
 
+struct mdss_fudge_factor {
+	u32 numer;
+	u32 denom;
+};
+
 struct mdss_debug_inf {
 	void *debug_data;
 	int (*debug_dump_stats)(void *data, char *buf, int len);
 	void (*debug_enable_clock)(int on);
+};
+
+struct mdss_prefill_data {
+	u32 ot_bytes;
+	u32 y_buf_bytes;
+	u32 y_scaler_lines_bilinear;
+	u32 y_scaler_lines_caf;
+	u32 post_scaler_pixels;
+	u32 pp_pixels;
+	u32 fbc_lines;
 };
 
 struct mdss_data_type {
@@ -120,10 +135,18 @@ struct mdss_data_type {
 
 	u32 rot_block_size;
 
+	u32 max_bw_low;
+	u32 max_bw_high;
+
 	u32 axi_port_cnt;
 	u32 curr_bw_uc_idx;
 	u32 bus_hdl;
 	struct msm_bus_scale_pdata *bus_scale_table;
+
+	struct mdss_fudge_factor ab_factor;
+	struct mdss_fudge_factor ib_factor;
+	struct mdss_fudge_factor ib_factor_overlap;
+	struct mdss_fudge_factor clk_factor;
 
 	struct mdss_hw_settings *hw_settings;
 
@@ -150,6 +173,7 @@ struct mdss_data_type {
 	u32 pp_bus_hdl;
 	struct mdss_ad_info *ad_cfgs;
 	u32 nad_cfgs;
+	u32 nmax_concurrent_ad_hw;
 	struct workqueue_struct *ad_calc_wq;
 
 	struct mdss_intr hist_intr;
@@ -165,6 +189,7 @@ struct mdss_data_type {
 	bool ulps;
 
 	int handoff_pending;
+	struct mdss_prefill_data prefill_data;
 };
 extern struct mdss_data_type *mdss_res;
 
@@ -187,7 +212,7 @@ int mdss_register_irq(struct mdss_hw *hw);
 void mdss_enable_irq(struct mdss_hw *hw);
 void mdss_disable_irq(struct mdss_hw *hw);
 void mdss_disable_irq_nosync(struct mdss_hw *hw);
-void mdss_bus_bandwidth_ctrl(int enable);
+int mdss_bus_bandwidth_ctrl(int enable);
 
 static inline struct ion_client *mdss_get_ionclient(void)
 {
