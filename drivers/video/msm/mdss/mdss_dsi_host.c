@@ -848,8 +848,6 @@ void mdss_dsi_host_init(struct mdss_panel_data *pdata)
 
 	if (pinfo->mode == DSI_VIDEO_MODE) {
 		data = 0;
-		if (pinfo->last_line_interleave_en)
-			data |= BIT(31);
 		if (pinfo->pulse_mode_hsa_he)
 			data |= BIT(28);
 		if (pinfo->hfp_power_stop)
@@ -1827,7 +1825,6 @@ void mdss_dsi_cmdlist_rx(struct mdss_dsi_ctrl_pdata *ctrl,
 void mdss_dsi_cmdlist_commit(struct mdss_dsi_ctrl_pdata *ctrl, int from_mdp)
 {
 	struct dcs_cmd_req *req;
-	int ret = -EINVAL;
 
 	mutex_lock(&ctrl->cmd_mutex);
 	req = mdss_dsi_cmdlist_get(ctrl);
@@ -1846,11 +1843,7 @@ void mdss_dsi_cmdlist_commit(struct mdss_dsi_ctrl_pdata *ctrl, int from_mdp)
 	 * also, axi bus bandwidth need since dsi controller will
 	 * fetch dcs commands from axi bus
 	 */
-	ret = mdss_bus_bandwidth_ctrl(1);
-	if (ret) {
-		pr_err("bus bandwidth request failed ret=%d\n", ret);
-		goto need_lock;
-	}
+	mdss_bus_bandwidth_ctrl(1);
 
 	pr_debug("%s:  from_mdp=%d pid=%d\n", __func__, from_mdp, current->pid);
 	mdss_dsi_clk_ctrl(ctrl, DSI_ALL_CLKS, 1);
