@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -41,7 +41,6 @@
 #define MAX_UPSCALE_RATIO	20
 #define MAX_DECIMATION		4
 #define MDP_MIN_VBP		4
-#define MAX_FREE_LIST_SIZE	12
 
 #define C3_ALPHA	3	/* alpha */
 #define C2_R_Cr		2	/* R/Cr */
@@ -332,11 +331,6 @@ struct mdss_mdp_pipe_smp_map {
 	DECLARE_BITMAP(fixed, MAX_DRV_SUP_MMB_BLKS);
 };
 
-struct mdss_mdp_shared_reg_ctrl {
-	u32 reg_off;
-	u32 bit_off;
-};
-
 struct mdss_mdp_pipe {
 	u32 num;
 	u32 type;
@@ -344,9 +338,6 @@ struct mdss_mdp_pipe {
 	char __iomem *base;
 	u32 ftch_id;
 	u32 xin_id;
-	struct mdss_mdp_shared_reg_ctrl clk_ctrl;
-	struct mdss_mdp_shared_reg_ctrl clk_status;
-
 	atomic_t ref_cnt;
 	u32 play_cnt;
 	int pid;
@@ -415,9 +406,6 @@ struct mdss_overlay_private {
 	struct list_head pipes_cleanup;
 	struct list_head rot_proc_list;
 	bool mixer_swap;
-
-	struct mdss_mdp_data free_list[MAX_FREE_LIST_SIZE];
-	int free_list_size;
 
 	struct sw_sync_timeline *vsync_timeline;
 	struct mdss_mdp_vsync_handler vsync_retire_handler;
@@ -509,7 +497,7 @@ int mdss_mdp_ctl_start(struct mdss_mdp_ctl *ctl, bool handoff);
 int mdss_mdp_ctl_stop(struct mdss_mdp_ctl *ctl);
 int mdss_mdp_ctl_intf_event(struct mdss_mdp_ctl *ctl, int event, void *arg);
 int mdss_mdp_perf_calc_pipe(struct mdss_mdp_pipe *pipe,
-	struct mdss_mdp_perf_params *perf, struct mdss_mdp_img_rect *roi);
+		struct mdss_mdp_perf_params *perf);
 int mdss_mdp_ctl_notify(struct mdss_mdp_ctl *ctl, int event);
 void mdss_mdp_ctl_notifier_register(struct mdss_mdp_ctl *ctl,
 	struct notifier_block *notifier);
@@ -527,7 +515,6 @@ struct mdss_mdp_pipe *mdss_mdp_mixer_stage_pipe(struct mdss_mdp_ctl *ctl,
 						int mux, int stage);
 int mdss_mdp_mixer_pipe_update(struct mdss_mdp_pipe *pipe, int params_changed);
 int mdss_mdp_mixer_pipe_unstage(struct mdss_mdp_pipe *pipe);
-void mdss_mdp_mixer_unstage_all(struct mdss_mdp_mixer *mixer);
 int mdss_mdp_display_commit(struct mdss_mdp_ctl *ctl, void *arg);
 int mdss_mdp_display_wait4comp(struct mdss_mdp_ctl *ctl);
 int mdss_mdp_display_wait4pingpong(struct mdss_mdp_ctl *ctl);
@@ -600,10 +587,10 @@ int mdss_mdp_mixer_addr_setup(struct mdss_data_type *mdata, u32 *mixer_offsets,
 int mdss_mdp_ctl_addr_setup(struct mdss_data_type *mdata, u32 *ctl_offsets,
 		u32 *wb_offsets, u32 len);
 
-int mdss_mdp_pipe_fetch_halt(struct mdss_mdp_pipe *pipe);
 int mdss_mdp_pipe_destroy(struct mdss_mdp_pipe *pipe);
 int mdss_mdp_pipe_queue_data(struct mdss_mdp_pipe *pipe,
 			     struct mdss_mdp_data *src_data);
+int mdss_mdp_pipe_fetch_halt(struct mdss_mdp_pipe *pipe);
 
 int mdss_mdp_data_check(struct mdss_mdp_data *data,
 			struct mdss_mdp_plane_sizes *ps);
@@ -622,10 +609,6 @@ int mdss_mdp_calc_phase_step(u32 src, u32 dst, u32 *out_phase);
 void mdss_mdp_intersect_rect(struct mdss_mdp_img_rect *res_rect,
 	const struct mdss_mdp_img_rect *dst_rect,
 	const struct mdss_mdp_img_rect *sci_rect);
-void mdss_mdp_crop_rect(struct mdss_mdp_img_rect *src_rect,
-	struct mdss_mdp_img_rect *dst_rect,
-	const struct mdss_mdp_img_rect *sci_rect);
-
 
 int mdss_mdp_wb_kickoff(struct msm_fb_data_type *mfd);
 int mdss_mdp_wb_ioctl_handler(struct msm_fb_data_type *mfd, u32 cmd, void *arg);

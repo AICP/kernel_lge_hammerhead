@@ -293,7 +293,6 @@ struct mdss_edp_drv_pdata {
 	struct clk *pixel_clk;
 	struct clk *ahb_clk;
 	struct clk *link_clk;
-	struct clk *mdp_core_clk;
 	int clk_on;
 
 	/* gpios */
