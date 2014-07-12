@@ -268,6 +268,8 @@ struct dsi_panel_cmds {
 
 #define CMD_REQ_MAX     4
 
+typedef void (*fxn)(u32 data);
+
 #define CMD_REQ_RX      0x0001
 #define CMD_REQ_COMMIT  0x0002
 #define CMD_CLK_CTRL    0x0004
@@ -278,8 +280,7 @@ struct dcs_cmd_req {
 	int cmds_cnt;
 	u32 flags;
 	int rlen;       /* rx length */
-	char *rbuf;	/* rx buf */
-	void (*cb)(int data);
+	fxn cb;
 };
 
 struct dcs_cmd_list {
@@ -404,7 +405,7 @@ int mdss_dsi_cmds_tx(struct mdss_dsi_ctrl_pdata *ctrl,
 		struct dsi_cmd_desc *cmds, int cnt);
 
 int mdss_dsi_cmds_rx(struct mdss_dsi_ctrl_pdata *ctrl,
-			struct dsi_cmd_desc *cmds, int rlen);
+			struct dsi_cmd_desc *cmds, int rlen, u32 rx_flags);
 
 void mdss_dsi_host_init(struct mdss_panel_data *pdata);
 void mdss_dsi_set_tear_on(struct mdss_dsi_ctrl_pdata *ctrl);

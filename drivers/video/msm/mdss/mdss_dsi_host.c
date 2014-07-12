@@ -27,7 +27,6 @@
 #include "mdss.h"
 #include "mdss_dsi.h"
 #include "mdss_panel.h"
-#include "mdss_debug.h"
 
 #define VSYNC_PERIOD 17
 
@@ -142,7 +141,6 @@ struct mdss_dsi_ctrl_pdata *mdss_dsi_ctrl_slave(
 
 void mdss_dsi_clk_req(struct mdss_dsi_ctrl_pdata *ctrl, int enable)
 {
-	MDSS_XLOG(ctrl->ndx, enable, ctrl->mdp_busy, current->pid);
 	if (enable == 0) {
 		/* need wait before disable */
 		mutex_lock(&ctrl->cmd_mutex);
@@ -150,7 +148,6 @@ void mdss_dsi_clk_req(struct mdss_dsi_ctrl_pdata *ctrl, int enable)
 		mutex_unlock(&ctrl->cmd_mutex);
 	}
 
-	MDSS_XLOG(ctrl->ndx, enable, ctrl->mdp_busy, current->pid);
 	mdss_dsi_clk_ctrl(ctrl, DSI_ALL_CLKS, enable);
 }
 
@@ -183,7 +180,6 @@ void mdss_dsi_enable_irq(struct mdss_dsi_ctrl_pdata *ctrl, u32 term)
 		return;
 	}
 	if (ctrl->dsi_irq_mask == 0) {
-		MDSS_XLOG(ctrl->ndx, term);
 		mdss_enable_irq(ctrl->dsi_hw);
 		pr_debug("%s: IRQ Enable, ndx=%d mask=%x term=%x\n", __func__,
 			ctrl->ndx, (int)ctrl->dsi_irq_mask, (int)term);
@@ -203,7 +199,6 @@ void mdss_dsi_disable_irq(struct mdss_dsi_ctrl_pdata *ctrl, u32 term)
 	}
 	ctrl->dsi_irq_mask &= ~term;
 	if (ctrl->dsi_irq_mask == 0) {
-		MDSS_XLOG(ctrl->ndx, term);
 		mdss_disable_irq(ctrl->dsi_hw);
 		pr_debug("%s: IRQ Disable, ndx=%d mask=%x term=%x\n", __func__,
 			ctrl->ndx, (int)ctrl->dsi_irq_mask, (int)term);
@@ -224,7 +219,6 @@ void mdss_dsi_disable_irq_nosync(struct mdss_dsi_ctrl_pdata *ctrl, u32 term)
 	}
 	ctrl->dsi_irq_mask &= ~term;
 	if (ctrl->dsi_irq_mask == 0) {
-		MDSS_XLOG(ctrl->ndx, term);
 		mdss_disable_irq_nosync(ctrl->dsi_hw);
 		pr_debug("%s: IRQ Disable, ndx=%d mask=%x term=%x\n", __func__,
 			ctrl->ndx, (int)ctrl->dsi_irq_mask, (int)term);
@@ -796,10 +790,17 @@ static int mdss_dsi_short_read2_resp(struct dsi_buf *rp)
 
 static int mdss_dsi_long_read_resp(struct dsi_buf *rp)
 {
+	short len;
+
+	len = rp->data[2];
+	len <<= 8;
+	len |= rp->data[1];
 	/* strip out dcs header */
 	rp->data += 4;
 	rp->len -= 4;
-	return rp->len;
+	/* strip out 2 bytes of checksum */
+	rp->len -= 2;
+	return len;
 }
 
 void mdss_dsi_cmd_test_pattern(struct mdss_panel_data *pdata)
@@ -1301,8 +1302,6 @@ int mdss_dsi_cmd_reg_tx(u32 data,
 
 static int mdss_dsi_wait4video_eng_busy(struct mdss_dsi_ctrl_pdata *ctrl);
 
-#define DMA_TX_TIMEOUT 200
-
 static int mdss_dsi_cmd_dma_tx(struct mdss_dsi_ctrl_pdata *ctrl,
 					struct dsi_buf *tp);
 
@@ -1326,8 +1325,7 @@ static int mdss_dsi_cmds2buf_tx(struct mdss_dsi_ctrl_pdata *ctrl,
 		mdss_dsi_buf_reserve(tp, len);
 		len = mdss_dsi_cmd_dma_add(tp, cm);
 		if (!len) {
-			pr_err("%s: failed to add cmd = 0x%x\n",
-				__func__,  cm->payload[0]);
+			pr_err("%s: failed to call cmd_dma_add\n", __func__);
 			return -EINVAL;
 		}
 		tot += len;
@@ -1430,25 +1428,24 @@ static struct dsi_cmd_desc pkt_size_cmd = {
 };
 
 /*
- * mdss_dsi_cmds_rx() - dcs read from panel
- * @ctrl: dsi controller
- * @cmds: read command descriptor
- * @len: number of bytes to read back
+ * DSI panel reply with  MAX_RETURN_PACKET_SIZE bytes of data
+ * plus DCS header, ECC and CRC for DCS long read response
+ * mdss_dsi_controller only have 4x32 bits register ( 16 bytes) to
+ * hold data per transaction.
+ * MIPI_DSI_LEN equal to 8
+ * len should be either 4 or 8
+ * any return data more than MIPI_DSI_LEN need to be break down
+ * to multiple transactions.
  *
- * controller have 4 registers can hold 16 bytes of rxed data
- * dcs packet: 4 bytes header + payload + 2 bytes crc
- * 2 padding bytes add to payload to have payload length is mutipled by 4
- * 1st read: 4 bytes header + 8 bytes payload + 2 padding + 2 crc
- * 2nd read: 12 bytes payload + 2 padding + 2 crc
- * 3rd read: 12 bytes payload + 2 padding + 2 crc
- *
+ * ov_mutex need to be acquired before call this function.
  */
+
 int mdss_dsi_cmds_rx(struct mdss_dsi_ctrl_pdata *ctrl,
-			struct dsi_cmd_desc *cmds, int rlen)
+			struct dsi_cmd_desc *cmds, int rlen, u32 rx_flags)
 {
-	int data_byte, rx_byte, dlen, end;
-	int short_response, diff, pkt_size, ret = 0;
+	int cnt, len, diff, pkt_size, ret = 0;
 	struct dsi_buf *tp, *rp;
+	int no_max_pkt_size;
 	char cmd;
 	u32 dsi_ctrl, data;
 	int video_mode;
@@ -1490,37 +1487,43 @@ int mdss_dsi_cmds_rx(struct mdss_dsi_ctrl_pdata *ctrl,
 		MIPI_OUTP((ctrl->ctrl_base) + 0x0004, data);
 	}
 
-	if (rlen <= 2) {
-		short_response = 1;
-		pkt_size = rlen;
-		rx_byte = 4;
-	} else {
-		short_response = 0;
-		data_byte = 8;	/* first read */
+	no_max_pkt_size = rx_flags & CMD_REQ_NO_MAX_PKT_SIZE;
+	if (no_max_pkt_size)
+		rlen = ALIGN(rlen, 4); /* Only support rlen = 4*n */
+
+	len = rlen;
+	diff = 0;
+
+	if (len <= 2)
+		cnt = 4;	/* short read */
+	else {
+		if (len > MDSS_DSI_LEN)
+			len = MDSS_DSI_LEN;	/* 8 bytes at most */
+
+		len = ALIGN(len, 4); /* len 4 bytes align */
+		diff = len - rlen;
 		/*
-		 * add extra 2 padding bytes to have overall
+		 * add extra 2 bytes to len to have overall
 		 * packet size is multipe by 4. This also make
 		 * sure 4 bytes dcs headerlocates within a
 		 * 32 bits register after shift in.
+		 * after all, len should be either 6 or 10.
 		 */
-		pkt_size = data_byte + 2;
-		rx_byte = data_byte + 8; /* 4 header + 2 crc  + 2 padding*/
+		len += 2;
+		cnt = len + 6; /* 4 bytes header + 2 bytes crc */
 	}
-
 
 	tp = &ctrl->tx_buf;
 	rp = &ctrl->rx_buf;
 
-	end = 0;
-	mdss_dsi_buf_init(rp);
-	while (!end) {
-		pr_debug("%s:  rlen=%d pkt_size=%d rx_byte=%d\n",
-				__func__, rlen, pkt_size, rx_byte);
+	if (!no_max_pkt_size) {
+		/* packet size need to be set at every read */
+		pkt_size = len;
 		max_pktsize[0] = pkt_size;
 		mdss_dsi_buf_init(tp);
 		ret = mdss_dsi_cmd_dma_add(tp, &pkt_size_cmd);
 		if (!ret) {
-			pr_err("%s: failed to add max_pkt_size\n",
+			pr_err("%s: failed to call\n",
 				__func__);
 			rp->len = 0;
 			goto end;
@@ -1532,66 +1535,61 @@ int mdss_dsi_cmds_rx(struct mdss_dsi_ctrl_pdata *ctrl,
 		ret = mdss_dsi_cmd_dma_tx(ctrl, tp);
 		if (IS_ERR_VALUE(ret)) {
 			mdss_dsi_disable_irq(ctrl, DSI_CMD_TERM);
-			pr_err("%s: failed to tx max_pkt_size\n",
+			pr_err("%s: failed to call\n",
 				__func__);
 			rp->len = 0;
 			goto end;
 		}
-		pr_debug("%s: max_pkt_size=%d sent\n",
-					__func__, pkt_size);
-
-		mdss_dsi_buf_init(tp);
-		ret = mdss_dsi_cmd_dma_add(tp, cmds);
-		if (!ret) {
-			pr_err("%s: failed to add cmd = 0x%x\n",
-				__func__,  cmds->payload[0]);
-			rp->len = 0;
-			goto end;
-		}
-
-		mdss_dsi_wait4video_eng_busy(ctrl);	/* video mode only */
-		mdss_dsi_enable_irq(ctrl, DSI_CMD_TERM);
-		/* transmit read comamnd to client */
-		ret = mdss_dsi_cmd_dma_tx(ctrl, tp);
-		if (IS_ERR_VALUE(ret)) {
-			mdss_dsi_disable_irq(ctrl, DSI_CMD_TERM);
-			pr_err("%s: failed to tx cmd = 0x%x\n",
-				__func__,  cmds->payload[0]);
-			rp->len = 0;
-			goto end;
-		}
-		/*
-		 * once cmd_dma_done interrupt received,
-		 * return data from client is ready and stored
-		 * at RDBK_DATA register already
-		 * since rx fifo is 16 bytes, dcs header is kept at first loop,
-		 * after that dcs header lost during shift into registers
-		 */
-		dlen = mdss_dsi_cmd_dma_rx(ctrl, rp, rx_byte);
-
-		if (short_response)
-			break;
-
-		if (rlen <= data_byte) {
-			diff = data_byte - rlen;
-			end = 1;
-		} else {
-			diff = 0;
-			rlen -= data_byte;
-		}
-
-		dlen -= 2; /* 2 padding bytes */
-		dlen -= 2; /* 2 crc */
-		dlen -= diff;
-		rp->data += dlen;	/* next start position */
-		rp->len += dlen;
-		data_byte = 12;	/* NOT first read */
-		pkt_size += data_byte;
-		pr_debug("%s: rp data=%x len=%d dlen=%d diff=%d\n",
-			__func__, (int)rp->data, rp->len, dlen, diff);
+		pr_debug("%s: Max packet size sent\n", __func__);
+	}
+	mdss_dsi_buf_init(tp);
+	ret = mdss_dsi_cmd_dma_add(tp, cmds);
+	if (!ret) {
+		pr_err("%s: failed to call cmd_dma_add for cmd = 0x%x\n",
+			__func__,  cmds->payload[0]);
+		rp->len = 0;
+		goto end;
 	}
 
-	rp->data = rp->start;	/* move back to start position */
+	mdss_dsi_wait4video_eng_busy(ctrl);
+
+	mdss_dsi_enable_irq(ctrl, DSI_CMD_TERM);
+	/* transmit read comamnd to client */
+	ret = mdss_dsi_cmd_dma_tx(ctrl, tp);
+	if (IS_ERR_VALUE(ret)) {
+		mdss_dsi_disable_irq(ctrl, DSI_CMD_TERM);
+		pr_err("%s: failed to call\n",
+			__func__);
+		rp->len = 0;
+		goto end;
+	}
+	/*
+	 * once cmd_dma_done interrupt received,
+	 * return data from client is ready and stored
+	 * at RDBK_DATA register already
+	 */
+	mdss_dsi_buf_init(rp);
+	if (no_max_pkt_size) {
+		/*
+		 * expect rlen = n * 4
+		 * short alignement for start addr
+		 */
+		rp->data += 2;
+	}
+
+	mdss_dsi_cmd_dma_rx(ctrl, rp, cnt);
+
+	if (no_max_pkt_size) {
+		/*
+		 * remove extra 2 bytes from previous
+		 * rx transaction at shift register
+		 * which was inserted during copy
+		 * shift registers to rx buffer
+		 * rx payload start from long alignment addr
+		 */
+		rp->data += 2;
+	}
+
 	cmd = rp->data[0];
 	switch (cmd) {
 	case DTYPE_ACK_ERR_RESP:
@@ -1608,6 +1606,8 @@ int mdss_dsi_cmds_rx(struct mdss_dsi_ctrl_pdata *ctrl,
 	case DTYPE_GEN_LREAD_RESP:
 	case DTYPE_DCS_LREAD_RESP:
 		mdss_dsi_long_read_resp(rp);
+		rp->len -= 2; /* extra 2 bytes added */
+		rp->len -= diff; /* align bytes */
 		break;
 	default:
 		pr_warning("%s:Invalid response cmd\n", __func__);
@@ -1689,14 +1689,14 @@ static int mdss_dsi_cmd_dma_tx(struct mdss_dsi_ctrl_pdata *ctrl,
 }
 
 static int mdss_dsi_cmd_dma_rx(struct mdss_dsi_ctrl_pdata *ctrl,
-			struct dsi_buf *rp, int rx_byte)
+			struct dsi_buf *rp, int rlen)
 
 {
 	u32 *lp, data;
 	int i, off, cnt;
 
 	lp = (u32 *)rp->data;
-	cnt = rx_byte;
+	cnt = rlen;
 	cnt += 3;
 	cnt >>= 2;
 
@@ -1712,9 +1712,9 @@ static int mdss_dsi_cmd_dma_rx(struct mdss_dsi_ctrl_pdata *ctrl,
 		pr_debug("%s: data = 0x%x and ntohl(data) = 0x%x\n",
 					 __func__, data, ntohl(data));
 		off -= 4;
+		rp->len += sizeof(*lp);
 	}
-
-	return rx_byte;
+	return rlen;
 }
 
 
@@ -1767,7 +1767,6 @@ void mdss_dsi_cmd_mdp_start(struct mdss_dsi_ctrl_pdata *ctrl)
 	mdss_dsi_enable_irq(ctrl, DSI_MDP_TERM);
 	ctrl->mdp_busy = true;
 	INIT_COMPLETION(ctrl->mdp_comp);
-	MDSS_XLOG(ctrl->ndx, ctrl->mdp_busy, current->pid);
 	spin_unlock_irqrestore(&ctrl->mdp_lock, flag);
 }
 
@@ -1775,11 +1774,10 @@ void mdss_dsi_cmd_mdp_busy(struct mdss_dsi_ctrl_pdata *ctrl)
 {
 	unsigned long flags;
 	int need_wait = 0;
+	uint32_t timeout = 1;
 
 	pr_debug("%s: start pid=%d\n",
 				__func__, current->pid);
-
-	MDSS_XLOG(ctrl->ndx, ctrl->mdp_busy, current->pid, XLOG_FUNC_ENTRY);
 	spin_lock_irqsave(&ctrl->mdp_lock, flags);
 	if (ctrl->mdp_busy == true)
 		need_wait++;
@@ -1789,16 +1787,13 @@ void mdss_dsi_cmd_mdp_busy(struct mdss_dsi_ctrl_pdata *ctrl)
 		/* wait until DMA finishes the current job */
 		pr_debug("%s: pending pid=%d\n",
 				__func__, current->pid);
-
-		if (!wait_for_completion_timeout(&ctrl->mdp_comp,
-					msecs_to_jiffies(DMA_TX_TIMEOUT))) {
-			pr_err("%s: timeout error\n", __func__);
-			MDSS_XLOG_TOUT_HANDLER("mdp", "dsi0", "dsi1",
-						"edp", "hdmi", "panic");
-		}
+		timeout = wait_for_completion_timeout(&ctrl->mdp_comp,
+			msecs_to_jiffies(2000));
+		if (!timeout)
+			pr_warn("%s: timedout\n", __func__);
 	}
-	pr_debug("%s: done pid=%d\n", __func__, current->pid);
-	MDSS_XLOG(ctrl->ndx, ctrl->mdp_busy, current->pid, XLOG_FUNC_EXIT);
+	pr_debug("%s: done pid=%d\n",
+				__func__, current->pid);
 }
 
 void mdss_dsi_cmdlist_tx(struct mdss_dsi_ctrl_pdata *ctrl,
@@ -1816,19 +1811,17 @@ void mdss_dsi_cmdlist_tx(struct mdss_dsi_ctrl_pdata *ctrl,
 void mdss_dsi_cmdlist_rx(struct mdss_dsi_ctrl_pdata *ctrl,
 				struct dcs_cmd_req *req)
 {
+	int len;
+	u32 data, *dp;
 	struct dsi_buf *rp;
-	int len = 0;
 
-	if (req->rbuf) {
-		rp = &ctrl->rx_buf;
-		len = mdss_dsi_cmds_rx(ctrl, req->cmds, req->rlen);
-		memcpy(req->rbuf, rp->data, rp->len);
-	} else {
-		pr_err("%s: No rx buffer provided\n", __func__);
-	}
+	len = mdss_dsi_cmds_rx(ctrl, req->cmds, req->rlen, req->flags);
+	rp = &ctrl->rx_buf;
+	dp = (u32 *)rp->data;
+	data = *dp;
 
 	if (req->cb)
-		req->cb(len);
+		req->cb(data);
 }
 
 void mdss_dsi_cmdlist_commit(struct mdss_dsi_ctrl_pdata *ctrl, int from_mdp)
@@ -1839,9 +1832,6 @@ void mdss_dsi_cmdlist_commit(struct mdss_dsi_ctrl_pdata *ctrl, int from_mdp)
 	mutex_lock(&ctrl->cmd_mutex);
 	req = mdss_dsi_cmdlist_get(ctrl);
 
-	MDSS_XLOG(ctrl->ndx, from_mdp, ctrl->mdp_busy, current->pid,
-							XLOG_FUNC_ENTRY);
-
 	/* make sure dsi_cmd_mdp is idle */
 	mdss_dsi_cmd_mdp_busy(ctrl);
 
@@ -1849,8 +1839,6 @@ void mdss_dsi_cmdlist_commit(struct mdss_dsi_ctrl_pdata *ctrl, int from_mdp)
 
 	if (req == NULL)
 		goto need_lock;
-
-	MDSS_XLOG(ctrl->ndx, req->flags, req->cmds_cnt, from_mdp, current->pid);
 
 	/*
 	 * mdss interrupt is generated in mdp core clock domain
@@ -1880,8 +1868,6 @@ need_lock:
 	if (from_mdp) /* from pipe_commit */
 		mdss_dsi_cmd_mdp_start(ctrl);
 
-	MDSS_XLOG(ctrl->ndx, from_mdp, ctrl->mdp_busy, current->pid,
-							XLOG_FUNC_EXIT);
 	mutex_unlock(&ctrl->cmd_mutex);
 }
 
@@ -1939,39 +1925,6 @@ int mdss_dsi_cmdlist_put(struct mdss_dsi_ctrl_pdata *ctrl,
 	return ret;
 }
 
-void mdss_dsi_debug_check_te(struct mdss_panel_data *pdata)
-{
-	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
-	u8 rc, te_count = 0;
-	u8 te_max = 250;
-
-	if (pdata == NULL) {
-		pr_err("%s: Invalid input data\n", __func__);
-		return;
-	}
-	ctrl_pdata = container_of(pdata, struct mdss_dsi_ctrl_pdata,
-				panel_data);
-
-	pr_info(" ============ start waiting for TE ============\n");
-	for (te_count = 0; te_count < te_max; te_count++) {
-		rc = gpio_get_value(ctrl_pdata->disp_te_gpio);
-		if (rc != 0) {
-			pr_info("%s: gpio_get_value(disp_te_gpio) = %d ",
-								__func__, rc);
-			pr_info("te_count = %d\n", te_count);
-			break;
-		}
-		/* usleep suspends the calling thread whereas udelay is a
-		 * busy wait. Here the value of te_gpio is checked in a loop of
-		 * max count = 250. If this loop has to iterate multiple
-		 * times before the te_gpio is 1, the calling thread will end
-		 * up in suspend/wakeup sequence multiple times if usleep is
-		 * used, which is an overhead. So use udelay instead of usleep.
-		 */
-		udelay(80);
-	}
-	pr_info(" ============ finish waiting for TE ============\n");
-}
 
 static void dsi_send_events(struct mdss_dsi_ctrl_pdata *ctrl, u32 events)
 {
@@ -2028,10 +1981,8 @@ static int dsi_event_thread(void *data)
 
 		if (todo & DSI_EV_MDP_FIFO_UNDERFLOW) {
 			if (ctrl->recovery) {
-				mdss_dsi_clk_ctrl(ctrl, DSI_ALL_CLKS, 1);
 				mdss_dsi_sw_reset_restore(ctrl);
 				ctrl->recovery->fxn(ctrl->recovery->data);
-				mdss_dsi_clk_ctrl(ctrl, DSI_ALL_CLKS, 0);
 			}
 		}
 
@@ -2043,9 +1994,7 @@ static int dsi_event_thread(void *data)
 			spin_unlock_irqrestore(&ctrl->mdp_lock, flag);
 
 			/* enable dsi error interrupt */
-			mdss_dsi_clk_ctrl(ctrl, DSI_ALL_CLKS, 1);
 			mdss_dsi_err_intr_ctrl(ctrl, DSI_INTR_ERROR_MASK, 1);
-			mdss_dsi_clk_ctrl(ctrl, DSI_ALL_CLKS, 0);
 		}
 
 	}
@@ -2113,8 +2062,6 @@ void mdss_dsi_fifo_status(struct mdss_dsi_ctrl_pdata *ctrl)
 		pr_err("%s: status=%x\n", __func__, status);
 		if (status & 0x0080)  /* CMD_DMA_FIFO_UNDERFLOW */
 			dsi_send_events(ctrl, DSI_EV_MDP_FIFO_UNDERFLOW);
-			MDSS_XLOG_TOUT_HANDLER("mdp", "dsi0", "dsi1",
-						"edp", "hdmi", "panic");
 	}
 }
 
@@ -2192,7 +2139,6 @@ irqreturn_t mdss_dsi_isr(int irq, void *ptr)
 	pr_debug("%s: ndx=%d isr=%x\n", __func__, ctrl->ndx, isr);
 
 	if (isr & DSI_INTR_ERROR) {
-		MDSS_XLOG(ctrl->ndx, ctrl->mdp_busy, isr, 0x97);
 		pr_err("%s: ndx=%d isr=%x\n", __func__, ctrl->ndx, isr);
 		mdss_dsi_error(ctrl);
 	}
@@ -2205,7 +2151,6 @@ irqreturn_t mdss_dsi_isr(int irq, void *ptr)
 	}
 
 	if (isr & DSI_INTR_CMD_DMA_DONE) {
-		MDSS_XLOG(ctrl->ndx, ctrl->mdp_busy, isr, 0x98);
 		spin_lock(&ctrl->mdp_lock);
 		mdss_dsi_disable_irq_nosync(ctrl, DSI_CMD_TERM);
 		complete(&ctrl->dma_comp);
@@ -2213,7 +2158,6 @@ irqreturn_t mdss_dsi_isr(int irq, void *ptr)
 	}
 
 	if (isr & DSI_INTR_CMD_MDP_DONE) {
-		MDSS_XLOG(ctrl->ndx, ctrl->mdp_busy, isr, 0x99);
 		spin_lock(&ctrl->mdp_lock);
 		ctrl->mdp_busy = false;
 		mdss_dsi_disable_irq_nosync(ctrl, DSI_MDP_TERM);
